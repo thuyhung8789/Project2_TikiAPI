@@ -3,7 +3,6 @@ import datetime
 import glob
 import json
 import os
-import random
 import re
 import time
 import aiohttp
@@ -11,137 +10,122 @@ import pandas as pd
 from bs4 import BeautifulSoup
 
 # =====================================================================
-# 1. CẤU HÌNH HỆ THỐNG (Có thể điều chỉnh tùy nhu cầu)
+# 1. CẤU HÌNH HỆ THỐNG
 # =====================================================================
-CSV_FOLDER = "source_csv"     # Tên file CSV chứa danh sách 200k ID ban đầu
-OUTPUT_DIR = "result_products_json"      # Thư mục lưu các file JSON kết quả
-ERROR_FILE ="failed_products.json"    # File lưu danh sách các sản phẩm bị lỗi
-SUCCESS_LOG_FILE ="success_ids2.txt"   # File lưu vết các ID đã tải thành công (Chase-back)
+CSV_FOLDER = "csv_data_folder"         # Thư mục chứa các file CSV đầu vào
+OUTPUT_DIR = "tiki_products_json"      # Thư mục lưu các file JSON kết quả
+ERROR_FILE = "failed_products.json"    # File lưu danh sách sản phẩm bị lỗi hệ thống
+SUCCESS_LOG_FILE = "success_ids.txt"   # File lưu vết các ID đã tải xong thành công
+DELETED_404_FILE = "deleted_ids_404.txt" # File lưu riêng các ID đã bị Tiki xóa vĩnh viễn
 
-CHUNK_SIZE = 1000             # Số lượng sản phẩm lưu trên mỗi file JSON
-CONCURRENT_REQUESTS = 20      # Số lượng request đồng thời tối đa (Tăng nếu nhiều proxy ngon)
-DELAY_BETWEEN_REQUESTS = 0.2  # Độ trễ nhỏ giữa các request của cùng một luồng (giây)
+CHUNK_SIZE = 1000             # Số lượng sản phẩm trên mỗi file JSON
+CONCURRENT_REQUESTS = 20      # Số lượng request đồng thời tối đa (Giảm xuống nếu chạy mạng nhà bị block)
+DELAY_BETWEEN_REQUESTS = 0.1  # Độ trễ nhỏ giữa các request (giây)
 
-# Giả lập trình duyệt (User-Agent) để tránh bị hệ thống Tiki chặn ngay từ đầu
+TIMEOUT = 15                  # Thời gian chờ tối đa cho mỗi request (giây)
+MAX_RETRIES = 3               # Số lần tự động thử lại tối đa khi gặp lỗi mạng/timeout
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "vi-VN,vi;q=0.9,fr-FR;q=0.8,en-US;q=0.6,en;q=0.5",
+    "Accept-Language": "vi-VN,vi;q=0.9,fr-FR;q=0.8",
 }
 
-# --- DANH SÁCH PROXY XOAY VÒNG ---
-# Hãy điền danh sách proxy HTTP/HTTPS của bạn vào đây. 
-# Định dạng có mật khẩu: "http://username:password@ip:port"
-# Định dạng không mật khẩu: "http://ip:port"
-#PROXIES = [
-    # "http://123.45.67.89:8080",
-    # "http://98.76.54.321:3128",
-#]
-
-# Biến toàn cục chứa danh sách lỗi tích lũy trong phiên chạy hiện tại
+# Danh sách toàn cục chứa lỗi phát sinh trong PHIÊN CHẠY HIỆN TẠI
 failed_products_list = []
 
 # =====================================================================
 # 2. CÁC HÀM BỔ TRỢ (HELPER FUNCTIONS)
 # =====================================================================
-#def get_random_proxy():
-#   Lấy ngẫu nhiên một proxy từ danh sách để thực hiện request.
- #   if not PROXIES:
-  #      return None
-   # return random.choice(PROXIES)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
 def clean_description(html_content):
-    """Chuẩn hóa nội dung description: Xóa toàn bộ thẻ HTML, làm sạch khoảng trắng."""
     if not html_content:
         return ""
-    # Loại bỏ toàn bộ tag HTML
     soup = BeautifulSoup(html_content, "html.parser")
     text = soup.get_text(separator=" ")
-
-    # Loại bỏ nhiều dấu cách, dấu tab, dấu xuống dòng liên tiếp thành một khoảng trắng duy nhất
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
 
 def log_failed_product(product_id, reason):
-    """Ghi nhận thông tin sản phẩm bị lỗi vào bộ nhớ tạm."""
+    """Ghi nhận lỗi vào danh sách tạm thời và đẩy thẳng vào file JSON"""
     error_item = {
         "id": int(product_id),
         "reason": reason,
         "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
     failed_products_list.append(error_item)
-    print(f"       [LỖI] ID {product_id}: {reason}")
+    print(f"       [THẤT BẠI HOÀN TOÀN] ID {product_id}: {reason}")
 
 
 def log_success_id(product_id):
-    """Ghi nhanh ID đã tải thành công vào file txt dưới dạng append (ghi nối tiếp)."""
     with open(SUCCESS_LOG_FILE, "a") as f:
         f.write(f"{product_id}\n")
 
+
+def log_deleted_404(product_id):
+    with open(DELETED_404_FILE, "a") as f:
+        f.write(f"{product_id}\n")
+
 # =====================================================================
-# 3. HÀM TẢI CHI TIẾT SẢN PHẨM (ASYNC WORKER)
+# 3. HÀM TẢI CHI TIẾT SẢN PHẨM (WORKER)
 # =====================================================================
 async def fetch_product(session, product_id, semaphore):
-    """Thực hiện gọi API lấy thông tin sản phẩm, bóc tách và làm sạch dữ liệu."""
     url = f"https://api.tiki.vn/product-detail/api/v1/products/{product_id}"
-  #  proxy_url = get_random_proxy()
 
     async with semaphore:
-        try:
-            # Gửi request với cấu hình headers, proxy ngẫu nhiên và thời gian timeout là 12 giây
-            async with session.get(url, headers=HEADERS, timeout=12) as response:
-                if response.status == 200:
-                    data = await response.json()
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                # Gửi request trực tiếp không qua proxy
+                async with session.get(url, headers=HEADERS, timeout=TIMEOUT) as response:
+                    
+                    if response.status == 200:
+                        data = await response.json()
+                        images = data.get("images", [])
+                        image_urls = [img.get("base_url") for img in images if img.get("base_url")]
 
-                    # Bóc tách mảng danh sách ảnh thành danh sách URL dạng text đơn giản
-                    images = data.get("images", [])
-                    image_urls = [img.get("base_url") for img in images if img.get("base_url")]
+                        product_info = {
+                            "id": data.get("id"),
+                            "name": data.get("name"),
+                            "url_key": data.get("url_key"),
+                            "price": data.get("price"),
+                            "description": clean_description(data.get("description")),
+                            "images_url": image_urls
+                        }
+                        log_success_id(product_id)
+                        return product_info
 
-                    # Tổ chức lại dữ liệu sạch theo yêu cầu
-                    product_info = {
-                        "id": data.get("id"),
-                        "name": data.get("name"),
-                        "url_key": data.get("url_key"),
-                        "price": data.get("price"),
-                        "description": clean_description(data.get("description")),
-                        "images_url": image_urls
-                    }
+                    elif response.status == 404:
+                        print(f"       [404 Not Found] ID {product_id} đã bị gỡ bỏ.")
+                        log_deleted_404(product_id)
+                        return None
 
-                    # Ghi nhận ID thành công vào file log txt để chase-back
-                    log_success_id(product_id)
-                    return product_info
+                    elif response.status in [403, 429]:
+                        print(f"       [Thử lại {attempt}/{MAX_RETRIES}] ID {product_id} bị Tiki chặn IP (Status {response.status}). Đang đợi thử lại...")
+                    else:
+                        print(f"       [Thử lại {attempt}/{MAX_RETRIES}] ID {product_id} dính lỗi HTTP {response.status}.")
 
-                elif response.status == 404:
-                    log_failed_product(product_id, "Product không tồn tại trên hệ thống (404)")
-                    return None
-                elif response.status in [403, 429]:
-                    log_failed_product(product_id, f"Bị Tiki chặn IP/Giới hạn tần suất (Status {response.status})")
-                    return None
-                else:
-                    log_failed_product(product_id, f"Lỗi phản hồi từ Tiki (Status {response.status})")
-                    return None
-
-        except aiohttp.ClientProxyConnectionError:
-            log_failed_product(product_id, f"Không thể kết nối thông qua Proxy: {proxy_url}")
-            return None
-        except asyncio.TimeoutError:
-            log_failed_product(product_id, "Request bị quá thời gian phản hồi (Timeout)")
-            return None
-        except Exception as e:
-            log_failed_product(product_id, f"Lỗi không xác định: {str(e)}")
-            return None
-        finally:
-            # Nghỉ một khoảng thời gian cực ngắn sau mỗi request để tránh spam dồn dập
-            await asyncio.sleep(DELAY_BETWEEN_REQUESTS)
+            except asyncio.TimeoutError:
+                print(f"       [Thử lại {attempt}/{MAX_RETRIES}] ID {product_id} bị Quá thời gian phản hồi (>{TIMEOUT}s).")
+            except Exception as e:
+                print(f"       [Thử lại {attempt}/{MAX_RETRIES}] ID {product_id} dính lỗi kết nối: {type(e).__name__}")
+            
+            # Nếu chưa hết số lần thử lại, đợi một chút tăng dần thời gian để giảm tải
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(attempt * 0.5)
+        
+        # Nếu đã thử trực tiếp 3 lần mà vẫn không được (ví dụ IP mạng nhà đã bị Tiki block cứng)
+        log_failed_product(product_id, f"Lỗi kết nối hoặc bị chặn sau {MAX_RETRIES} lần thử lại.")
+        return None
 
 # =====================================================================
 # 4. HÀM ĐIỀU PHỐI CHÍNH (MAIN PROCESS)
 # =====================================================================
 async def main():
-    # Bước 1: Kiểm tra file CSV đầu vào
-# Lấy danh sách tất cả các file .csv trong thư mục
+    global failed_products_list
+    if not os.path.exists(CSV_FOLDER):
+        print(f"Lỗi: Không tìm thấy thư mục CSV '{CSV_FOLDER}'!")
+        return
+
     csv_files = glob.glob(os.path.join(CSV_FOLDER, "*.csv"))
     if not csv_files:
         print(f"Không tìm thấy file .csv nào trong thư mục '{CSV_FOLDER}'!")
@@ -151,18 +135,37 @@ async def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
 
-    # Khởi tạo một phiên kết nối duy nhất dùng chung cho toàn bộ chương trình
+    # --- BƯỚC NÂNG CẤP CHỐNG QUÉT LẠI (PRE-LOAD LOGS) ---
+    ignore_ids = set()
+
+    # 1. Nạp ID thành công
+    if os.path.exists(SUCCESS_LOG_FILE):
+        with open(SUCCESS_LOG_FILE, "r") as f:
+            ignore_ids.update(int(line.strip()) for line in f if line.strip())
+
+    # 2. Nạp ID lỗi 404 vĩnh viễn
+    if os.path.exists(DELETED_404_FILE):
+        with open(DELETED_404_FILE, "r") as f:
+            ignore_ids.update(int(line.strip()) for line in f if line.strip())
+
+    # 3. Nạp ID lỗi hệ thống đã có trong file JSON để ignore
+    if os.path.exists(ERROR_FILE):
+        try:
+            with open(ERROR_FILE, "r", encoding="utf-8") as f:
+                existing_errors = json.load(f)
+                failed_products_list = existing_errors
+                ignore_ids.update(int(item["id"]) for item in existing_errors if "id" in item)
+        except Exception:
+            print("⚠️ File lỗi JSON bị hỏng hoặc trống, sẽ khởi tạo mới.")
+
     async with aiohttp.ClientSession() as session:
-        
-        # VÒNG LẶP DUYỆT TỪNG FILE CSV TRONG THƯ MỤC
         for file_idx, csv_file_path in enumerate(csv_files, 1):
             file_name_only = os.path.basename(csv_file_path)
             print(f"\n==================================================================")
-            print(f"📂 [{file_idx}/{len(csv_files)}] ĐANG XỬ LÝ FILE: {file_name_only}")
+            print(f"📂 [{file_idx}/{len(csv_files)}] ĐANG ĐỌC FILE: {file_name_only}")
             print(f"==================================================================")
 
             try:
-                # Đọc danh sách ID từ file CSV hiện tại
                 df = pd.read_csv(csv_file_path)
                 if "id" not in df.columns:
                     print(f"⚠️ Bỏ qua file {file_name_only} vì không có cột 'id'!")
@@ -170,35 +173,27 @@ async def main():
                 
                 all_product_ids = df["id"].dropna().unique().tolist()
                 
-                # Đọc lịch sử các ID đã chạy thành công trước đó (bất kể thuộc file CSV nào)
-                success_ids = set()
-                if os.path.exists(SUCCESS_LOG_FILE):
-                    with open(SUCCESS_LOG_FILE, "r") as f:
-                        success_ids = set(int(line.strip()) for line in f if line.strip())
-                        
-                # Lọc sạch: Chỉ lấy những ID chưa chạy
-                product_ids = [pid for pid in all_product_ids if pid not in success_ids]
+                # Sàng lọc thông minh: Loại bỏ mọi ID nằm trong blacklist (Success + 404 + Fail JSON)
+                product_ids = [pid for pid in all_product_ids if int(pid) not in ignore_ids]
                 total_products = len(product_ids)
                 
-                print(f" -> Tổng số ID trong file: {len(all_product_ids):,}")
-                print(f" -> ID đã hoàn thành trước đây: {len(all_product_ids) - total_products:,}")
-                print(f" -> ID còn lại cần tải của file này: {total_products:,}")
+                print(f" -> Tổng số ID gốc của file: {len(all_product_ids):,}")
+                print(f" -> Số ID được bỏ qua (Đã xử lý/Lỗi trước đó): {len(all_product_ids) - total_products:,}")
+                print(f" -> Số ID thực tế sẽ cào lượt này: {total_products:,}")
 
                 if total_products == 0:
-                    print(f"✨ File {file_name_only} đã được hoàn thành trước đó. Chuyển file tiếp theo.")
+                    print(f"✨ File {file_name_only} không còn ID nào cần tải. Tiếp tục chuyển file...")
                     continue
 
-                # Bắt đầu chia cụm (chunk) cho file CSV hiện tại
                 for i in range(0, total_products, CHUNK_SIZE):
                     chunk_ids = product_ids[i : i + CHUNK_SIZE]
                     
-                    # Tạo tên file JSON có chứa tên file CSV gốc để bạn dễ phân loại dữ liệu sau này
                     current_timestamp = int(time.time())
                     clean_csv_name = re.sub(r'[^\w\-_]', '_', file_name_only.replace('.csv', ''))
                     json_file_name = f"data_{clean_csv_name}_{current_timestamp}_{i // CHUNK_SIZE + 1}.json"
                     json_file_path = os.path.join(OUTPUT_DIR, json_file_name)
 
-                    print(f"\n🚀 Tải cụm sản phẩm (Từ STT {i:,} đến {i+len(chunk_ids):,}) của file {file_name_only}...")
+                    print(f"\n🚀 Đang tải cụm sản phẩm (Từ STT {i:,} đến {i+len(chunk_ids):,}) của file {file_name_only}...")
 
                     tasks = [fetch_product(session, pid, semaphore) for pid in chunk_ids]
                     results = await asyncio.gather(*tasks)
@@ -209,19 +204,20 @@ async def main():
                             json.dump(valid_results, f, ensure_ascii=False, indent=4)
                         print(f"   => Đã lưu {len(valid_results)} sản phẩm vào: {json_file_path}")
 
-                    # Cập nhật danh sách lỗi định kỳ
+                    # Cập nhật ghi đè file lỗi JSON một cách an toàn (Bao gồm cả dữ liệu cũ lịch sử)
                     if failed_products_list:
                         with open(ERROR_FILE, "w", encoding="utf-8") as ef:
                             json.dump(failed_products_list, ef, ensure_ascii=False, indent=4)
+
+                    await asyncio.sleep(0.5)
 
             except Exception as file_error:
                 print(f"❌ Có lỗi xảy ra khi xử lý file {file_name_only}: {str(file_error)}")
                 continue
 
-    # --- BÁO CÁO TỔNG KẾT ---
     print("\n==================================================================")
-    print("🏁 TOÀN BỘ THƯ MỤC CSV ĐÃ ĐƯỢC XỬ LÝ XONG!")
-    print(f" -> Tổng số lỗi phát sinh: {len(failed_products_list):,}")
+    print("🏁 TOÀN BỘ TIẾN TRÌNH ĐÃ HOÀN THÀNH!")
+    print(f" -> Tổng số lỗi tích lũy trong hệ thống: {len(failed_products_list):,}")
     print("==================================================================")
 
 
