@@ -16,9 +16,9 @@ Yêu cầu chuẩn hoá nội dung trong "description" và tìm phương án rú
 - Support write success and failed log to ignore if rerun
   
 **Input data**:
-the lists ID keep in folder with 3 csv files.
+the lists ID keep in folder with 3 csv files with total 600 IDs:
 
-/code/source_csv
+Locate in: /code/source_csv
 
 **Output data**:
 
